@@ -28,16 +28,20 @@ func (c *Connection) Connect(ctx context.Context, connectKey string) error {
 	}
 	c.c = conn
 	// handshake
-	banner, err := c.ReadValue(ctx)
+	hello, err := c.ReadValue(ctx)
 	if err != nil {
 		conn.Close()
 		return err
 	}
-	if len(banner) < len(handshakePrefix) || string(banner[:len(handshakePrefix)]) != handshakePrefix {
+	if len(hello) < len(handshakePrefix) || string(hello[:len(handshakePrefix)]) != handshakePrefix {
 		conn.Close()
 		return errors.New("Channel Hello failed")
 	}
-	// send back handshake: banner + connectKey(32 bytes)
+	// send back handshake: banner(12 bytes) + connectKey(32 bytes)
+	banner := hello
+	if len(banner) > 12 {
+		banner = banner[:12]
+	}
 	key := make([]byte, 32)
 	copy(key, []byte(connectKey))
 	data := append(banner, key...)

@@ -2,7 +2,6 @@ package hdc
 
 import (
 	"context"
-	"net"
 	"os"
 	"os/exec"
 	"strconv"
@@ -42,16 +41,13 @@ func NewClient(o Options) *Client {
 func (c *Client) connection(ctx context.Context, connectKey string) (*Connection, error) {
 	conn := NewConnection(c.opts)
 	if err := conn.Connect(ctx, connectKey); err != nil {
-		var nerr net.Error
-		if opErr, ok := err.(*net.OpError); ok && !conn.triedStart && opErr.Err != nil {
-			// try start server once
-			if e := c.startServer(ctx); e == nil {
-				conn.triedStart = true
-				if e2 := conn.Connect(ctx, connectKey); e2 == nil {
-					return conn, nil
-				} else {
-					return nil, e2
-				}
+		if !conn.triedStart {
+			_ = c.startServer(ctx)
+			conn.triedStart = true
+			if e2 := conn.Connect(ctx, connectKey); e2 == nil {
+				return conn, nil
+			} else {
+				return nil, e2
 			}
 		}
 		return nil, err
