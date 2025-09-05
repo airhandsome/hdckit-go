@@ -1,0 +1,316 @@
+package hdc
+
+import (
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"net"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	uiHeader = "_uitestkit_rpc_message_head_"
+	uiTailer = "_uitestkit_rpc_message_tail_"
+)
+
+// UiDriver provides minimal uitest RPC capabilities similar to TS version.
+type UiDriver struct {
+	target     *Target
+	driverName string
+	port       int
+	conn       *uiRPCConn
+	mu         sync.Mutex
+}
+
+func (t *Target) CreateUiDriver() *UiDriver { return &UiDriver{target: t} }
+
+func (d *UiDriver) Start(ctx context.Context) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.conn != nil {
+		return nil
+	}
+	// ensure uitest daemon running; best-effort
+	_ = d.shell(ctx, "param set persist.ace.testmode.enabled 1")
+	// try start-daemon, ignore errors
+	_ = d.shell(ctx, "uitest start-daemon singleness")
+	// ensure forward tcp:8012
+	p, err := d.forwardTcp(ctx, 8012)
+	if err != nil {
+		return err
+	}
+	rpc := &uiRPCConn{}
+	if err := rpc.Connect(ctx, p); err != nil {
+		return err
+	}
+	// create driver
+	res, err := rpc.SendMessage(ctx, map[string]any{
+		"module": "com.ohos.devicetest.hypiumApiHelper",
+		"method": "callHypiumApi",
+		"params": map[string]any{
+			"api":          "Driver.create",
+			"this":         nil,
+			"args":         []any{},
+			"message_type": "hypium",
+		},
+	}, time.Second)
+	if err != nil {
+		rpc.Close()
+		return err
+	}
+	if s, ok := res.(string); ok {
+		d.driverName = s
+	} else {
+		rpc.Close()
+		return errors.New("invalid create response")
+	}
+	d.conn = rpc
+	d.port = p
+	return nil
+}
+
+func (d *UiDriver) Stop() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.conn != nil {
+		d.conn.Close()
+		d.conn = nil
+	}
+}
+
+func (d *UiDriver) GetDisplaySize(ctx context.Context) (map[string]any, error) {
+	if err := d.ensure(ctx); err != nil {
+		return nil, err
+	}
+	res, err := d.call(ctx, "CtrlCmd", "getDisplaySize", nil)
+	if err != nil {
+		return nil, err
+	}
+	if m, ok := res.(map[string]any); ok {
+		return m, nil
+	}
+	return nil, errors.New("unexpected result")
+}
+
+func (d *UiDriver) InputText(ctx context.Context, text string, x, y int) error {
+	if err := d.ensure(ctx); err != nil {
+		return err
+	}
+	_, err := d.conn.SendMessage(ctx, map[string]any{
+		"module": "com.ohos.devicetest.hypiumApiHelper",
+		"method": "callHypiumApi",
+		"params": map[string]any{
+			"api":          "Driver.inputText",
+			"this":         d.driverName,
+			"args":         []any{map[string]int{"x": x, "y": y}, text},
+			"message_type": "hypium",
+		},
+	}, 3*time.Second)
+	return err
+}
+
+func (d *UiDriver) CaptureLayout(ctx context.Context) (any, error) {
+	if err := d.ensure(ctx); err != nil {
+		return nil, err
+	}
+	return d.call(ctx, "Captures", "captureLayout", nil)
+}
+
+func (d *UiDriver) ensure(ctx context.Context) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.conn != nil {
+		return nil
+	}
+	return d.Start(ctx)
+}
+
+func (d *UiDriver) call(ctx context.Context, method, api string, args any) (any, error) {
+	payload := map[string]any{
+		"module": "com.ohos.devicetest.hypiumApiHelper",
+		"method": method,
+		"params": map[string]any{
+			"api":  api,
+			"args": args,
+		},
+	}
+	return d.conn.SendMessage(ctx, payload, 3*time.Second)
+}
+
+func (d *UiDriver) forwardTcp(ctx context.Context, remotePort int) (int, error) {
+	remote := "tcp:" + strconv.Itoa(remotePort)
+	forwards, err := d.target.ListForwards(ctx)
+	if err == nil {
+		for _, f := range forwards {
+			if f.Remote == remote {
+				// parse local tcp:port
+				if strings.HasPrefix(f.Local, "tcp:") {
+					if p, err := strconv.Atoi(strings.TrimPrefix(f.Local, "tcp:")); err == nil {
+						return p, nil
+					}
+				}
+			}
+		}
+	}
+	// allocate free port
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	p := l.Addr().(*net.TCPAddr).Port
+	_ = l.Close()
+	local := "tcp:" + strconv.Itoa(p)
+	if err := d.target.Forward(ctx, local, remote); err != nil {
+		return 0, err
+	}
+	return p, nil
+}
+
+func (d *UiDriver) shell(ctx context.Context, cmd string) error {
+	c, err := d.target.Shell(ctx, cmd)
+	if err != nil {
+		return err
+	}
+	_, err = c.ReadAll(ctx)
+	return err
+}
+
+// uiRPCConn implements uitest RPC framing protocol.
+type uiRPCConn struct {
+	c        net.Conn
+	mu       sync.Mutex
+	resolves map[uint32]chan any
+	onMsg    func(session uint32, payload []byte)
+}
+
+func (u *uiRPCConn) Connect(ctx context.Context, port int) error {
+	d := net.Dialer{}
+	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if err != nil {
+		return err
+	}
+	u.c = conn
+	u.resolves = make(map[uint32]chan any)
+	go u.readLoop()
+	return nil
+}
+
+func (u *uiRPCConn) Close() {
+	if u.c != nil {
+		_ = u.c.Close()
+	}
+}
+
+func (u *uiRPCConn) OnMessage(cb func(session uint32, payload []byte)) {
+	u.mu.Lock()
+	u.onMsg = cb
+	u.mu.Unlock()
+}
+
+func (u *uiRPCConn) SendMessage(ctx context.Context, message any, timeout time.Duration) (any, error) {
+	payload, _ := json.Marshal(message)
+	sessionId := uint32(time.Now().UnixNano())
+	sid := make([]byte, 4)
+	binary.BigEndian.PutUint32(sid, sessionId)
+	// frame: header + sessionId + len + payload + tailer
+	var length [4]byte
+	binary.BigEndian.PutUint32(length[:], uint32(len(payload)))
+	frame := make([]byte, 0, len(uiHeader)+8+len(payload)+len(uiTailer))
+	frame = append(frame, []byte(uiHeader)...)
+	frame = append(frame, sid...)
+	frame = append(frame, length[:]...)
+	frame = append(frame, payload...)
+	frame = append(frame, []byte(uiTailer)...)
+
+	ch := make(chan any, 1)
+	u.mu.Lock()
+	u.resolves[sessionId] = ch
+	u.mu.Unlock()
+
+	if _, err := u.c.Write(frame); err != nil {
+		return nil, err
+	}
+
+	if timeout > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case resp := <-ch:
+			return resp, nil
+		case <-time.After(timeout):
+			u.mu.Lock()
+			delete(u.resolves, sessionId)
+			u.mu.Unlock()
+			return nil, errors.New("timeout")
+		}
+	}
+	return <-ch, nil
+}
+
+func (u *uiRPCConn) readLoop() {
+	header := []byte(uiHeader)
+	tailer := []byte(uiTailer)
+	buf := make([]byte, 0)
+	tmp := make([]byte, 4096)
+	for {
+		n, err := u.c.Read(tmp)
+		if err != nil {
+			return
+		}
+		buf = append(buf, tmp[:n]...)
+		for {
+			if len(buf) < len(header)+8 {
+				break
+			}
+			if string(buf[:len(header)]) != uiHeader {
+				buf = buf[:0]
+				break
+			}
+			sid := binary.BigEndian.Uint32(buf[len(header):])
+			l := binary.BigEndian.Uint32(buf[len(header)+4:])
+			total := len(header) + 8 + int(l) + len(tailer)
+			if len(buf) < total {
+				break
+			}
+			start := len(header) + 8
+			end := start + int(l)
+			payload := buf[start:end]
+			if string(buf[end:total]) != uiTailer {
+				buf = buf[:0]
+				break
+			}
+			// try JSON first
+			var result struct {
+				Result    any `json:"result"`
+				Exception *struct {
+					Message string `json:"message"`
+				} `json:"exception"`
+			}
+			var val any
+			if err := json.Unmarshal(payload, &result); err == nil {
+				if result.Exception != nil {
+					val = errors.New(result.Exception.Message)
+				} else {
+					val = result.Result
+				}
+			} else {
+				val = payload
+			}
+			u.mu.Lock()
+			ch := u.resolves[sid]
+			delete(u.resolves, sid)
+			cb := u.onMsg
+			u.mu.Unlock()
+			if ch != nil {
+				ch <- val
+			} else if cb != nil {
+				cb(sid, payload)
+			}
+			buf = buf[total:]
+		}
+	}
+}
