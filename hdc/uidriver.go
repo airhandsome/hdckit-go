@@ -5,7 +5,10 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,9 +27,14 @@ type UiDriver struct {
 	port       int
 	conn       *uiRPCConn
 	mu         sync.Mutex
+	sdkVersion string
+	sdkPath    string
 }
 
 func (t *Target) CreateUiDriver() *UiDriver { return &UiDriver{target: t} }
+
+// SetSdk allows overriding sdk path and version.
+func (d *UiDriver) SetSdk(path, version string) { d.sdkPath = path; d.sdkVersion = version }
 
 func (d *UiDriver) Start(ctx context.Context) error {
 	d.mu.Lock()
@@ -34,10 +42,16 @@ func (d *UiDriver) Start(ctx context.Context) error {
 	if d.conn != nil {
 		return nil
 	}
-	// ensure uitest daemon running; best-effort
+	// enable test mode
 	_ = d.shell(ctx, "param set persist.ace.testmode.enabled 1")
-	// try start-daemon, ignore errors
+	// ensure SDK agent
+	if err := d.ensureSdk(ctx); err != nil {
+		return err
+	}
+	// ensure uitest daemon running
 	_ = d.shell(ctx, "uitest start-daemon singleness")
+	// give daemon time to come up similar to TS
+	time.Sleep(2 * time.Second)
 	// ensure forward tcp:8012
 	p, err := d.forwardTcp(ctx, 8012)
 	if err != nil {
@@ -80,6 +94,8 @@ func (d *UiDriver) Stop() {
 		d.conn.Close()
 		d.conn = nil
 	}
+	// best-effort kill uitest daemon
+	_ = d.shell(context.Background(), "sh -c 'pidof uitest && kill -9 $(pidof uitest)'")
 }
 
 func (d *UiDriver) GetDisplaySize(ctx context.Context) (map[string]any, error) {
@@ -179,6 +195,88 @@ func (d *UiDriver) shell(ctx context.Context, cmd string) error {
 	return err
 }
 
+// ensureSdk checks and pushes uitest agent if needed.
+func (d *UiDriver) ensureSdk(ctx context.Context) error {
+	if d.sdkVersion == "" {
+		d.sdkVersion = "1.1.0"
+	}
+	if d.sdkPath == "" {
+		d.sdkPath = defaultSdkPath()
+	}
+	// check version on device
+	raw, _ := d.catAgent(ctx)
+	if !strings.Contains(raw, "UITEST_AGENT_LIBRARY") || cmpVersion(extractVersion(raw), d.sdkVersion) < 0 {
+		_ = d.shell(ctx, "rm /data/local/tmp/agent.so")
+		if err := d.target.SendFile(ctx, d.sdkPath, "/data/local/tmp/agent.so"); err != nil {
+			return fmt.Errorf("send agent failed: %w", err)
+		}
+	}
+	return nil
+}
+
+func (d *UiDriver) catAgent(ctx context.Context) (string, error) {
+	c, err := d.target.Shell(ctx, "cat /data/local/tmp/agent.so | grep -a UITEST_AGENT_LIBRARY")
+	if err != nil {
+		return "", err
+	}
+	b, err := c.ReadAll(ctx)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+func defaultSdkPath() string {
+	wd, _ := os.Getwd()
+	candidates := []string{
+		filepath.Join(wd, "uitestkit_sdk", "uitest_agent_v1.1.0.so"),
+		filepath.Join(wd, "..", "uitestkit_sdk", "uitest_agent_v1.1.0.so"),
+	}
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return "uitestkit_sdk/uitest_agent_v1.1.0.so"
+}
+
+// minimal version compare: returns -1/0/1
+func cmpVersion(a, b string) int {
+	if a == b {
+		return 0
+	}
+	as := strings.Split(a, ".")
+	bs := strings.Split(b, ".")
+	n := len(as)
+	if len(bs) > n {
+		n = len(bs)
+	}
+	for i := 0; i < n; i++ {
+		ai, bi := 0, 0
+		if i < len(as) {
+			ai, _ = strconv.Atoi(as[i])
+		}
+		if i < len(bs) {
+			bi, _ = strconv.Atoi(bs[i])
+		}
+		if ai < bi {
+			return -1
+		}
+		if ai > bi {
+			return 1
+		}
+	}
+	return 0
+}
+
+func extractVersion(raw string) string {
+	idx := strings.Index(raw, "@v")
+	if idx >= 0 {
+		return strings.TrimSpace(raw[idx+2:])
+	}
+	return ""
+}
+
 // uiRPCConn implements uitest RPC framing protocol.
 type uiRPCConn struct {
 	c        net.Conn
@@ -249,6 +347,48 @@ func (u *uiRPCConn) SendMessage(ctx context.Context, message any, timeout time.D
 		}
 	}
 	return <-ch, nil
+}
+
+// SendMessageWithSession sends and returns (sessionId, result, error).
+func (u *uiRPCConn) SendMessageWithSession(ctx context.Context, message any, timeout time.Duration) (uint32, any, error) {
+	payload, _ := json.Marshal(message)
+	sessionId := uint32(time.Now().UnixNano())
+	sid := make([]byte, 4)
+	binary.BigEndian.PutUint32(sid, sessionId)
+	var length [4]byte
+	binary.BigEndian.PutUint32(length[:], uint32(len(payload)))
+	frame := make([]byte, 0, len(uiHeader)+8+len(payload)+len(uiTailer))
+	frame = append(frame, []byte(uiHeader)...)
+	frame = append(frame, sid...)
+	frame = append(frame, length[:]...)
+	frame = append(frame, payload...)
+	frame = append(frame, []byte(uiTailer)...)
+
+	ch := make(chan any, 1)
+	u.mu.Lock()
+	u.resolves[sessionId] = ch
+	u.mu.Unlock()
+
+	if _, err := u.c.Write(frame); err != nil {
+		return sessionId, nil, err
+	}
+	var resp any
+	if timeout > 0 {
+		select {
+		case <-ctx.Done():
+			return sessionId, nil, ctx.Err()
+		case r := <-ch:
+			resp = r
+		case <-time.After(timeout):
+			u.mu.Lock()
+			delete(u.resolves, sessionId)
+			u.mu.Unlock()
+			return sessionId, nil, errors.New("timeout")
+		}
+	} else {
+		resp = <-ch
+	}
+	return sessionId, resp, nil
 }
 
 func (u *uiRPCConn) readLoop() {
