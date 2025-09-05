@@ -6,6 +6,7 @@ Cross-platform Go client and CLI for controlling OpenHarmony devices via hdc.
 - hdc binary in PATH or specify via options/flags
 - Default server port 8710 (override by `OHOS_HDC_SERVER_PORT`)
 - For UiDriver, place `uitestkit_sdk/uitest_agent_v1.1.0.so` in working dir (or parent dir). Go SDK will auto-push/update agent to `/data/local/tmp/agent.so`.
+- prepare hdc command line
 
 ### Install (library)
 ```bash
