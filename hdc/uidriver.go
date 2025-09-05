@@ -62,7 +62,7 @@ func (d *UiDriver) Start(ctx context.Context) error {
 		return err
 	}
 	// create driver
-	res, err := rpc.SendMessage(ctx, map[string]any{
+	payload := map[string]any{
 		"module": "com.ohos.devicetest.hypiumApiHelper",
 		"method": "callHypiumApi",
 		"params": map[string]any{
@@ -71,10 +71,29 @@ func (d *UiDriver) Start(ctx context.Context) error {
 			"args":         []any{},
 			"message_type": "hypium",
 		},
-	}, time.Second)
+	}
+	res, err := rpc.SendMessage(ctx, payload, time.Second)
 	if err != nil {
+		// Recovery: remove device agent and resend, restart daemon, reconnect, retry once
 		rpc.Close()
-		return err
+		_ = d.shell(ctx, "rm /data/local/tmp/agent.so")
+		if d.sdkPath == "" {
+			d.sdkPath = defaultSdkPath()
+		}
+		if err2 := d.target.SendFile(ctx, d.sdkPath, "/data/local/tmp/agent.so"); err2 != nil {
+			return fmt.Errorf("reinstall agent failed: %w", err2)
+		}
+		_ = d.shell(ctx, "uitest start-daemon singleness")
+		time.Sleep(2 * time.Second)
+		rpc = &uiRPCConn{}
+		if err2 := rpc.Connect(ctx, p); err2 != nil {
+			return err2
+		}
+		res, err = rpc.SendMessage(ctx, payload, time.Second)
+		if err != nil {
+			rpc.Close()
+			return err
+		}
 	}
 	if s, ok := res.(string); ok {
 		d.driverName = s
