@@ -22,13 +22,18 @@ const (
 
 // UiDriver provides minimal uitest RPC capabilities similar to TS version.
 type UiDriver struct {
-	target     *Target
-	driverName string
-	port       int
-	conn       *uiRPCConn
-	mu         sync.Mutex
-	sdkVersion string
-	sdkPath    string
+	target        *Target
+	driverName    string
+	port          int
+	conn          *uiRPCConn
+	mu            sync.Mutex
+	sdkVersion    string
+	sdkPath       string
+	needEnsureSDK bool
+}
+
+func (d *UiDriver) SetNeedEnsureSDK(needEnsureSDK bool) {
+	d.needEnsureSDK = needEnsureSDK
 }
 
 func (t *Target) CreateUiDriver() *UiDriver { return &UiDriver{target: t} }
@@ -216,6 +221,9 @@ func (d *UiDriver) shell(ctx context.Context, cmd string) error {
 
 // ensureSdk checks and pushes uitest agent if needed.
 func (d *UiDriver) ensureSdk(ctx context.Context) error {
+	if !d.needEnsureSDK {
+		return nil
+	}
 	if d.sdkVersion == "" {
 		d.sdkVersion = "1.1.0"
 	}
