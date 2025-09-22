@@ -51,6 +51,7 @@ func (d *UiDriver) Start(ctx context.Context) error {
 	_ = d.shell(ctx, "param set persist.ace.testmode.enabled 1")
 	// ensure SDK agent
 	if err := d.ensureSdk(ctx); err != nil {
+		fmt.Println("ensureSdk failed", err)
 		return err
 	}
 	// ensure uitest daemon running
@@ -60,10 +61,12 @@ func (d *UiDriver) Start(ctx context.Context) error {
 	// ensure forward tcp:8012
 	p, err := d.forwardTcp(ctx, 8012)
 	if err != nil {
+		fmt.Println("forwardTcp failed", err)
 		return err
 	}
 	rpc := &uiRPCConn{}
 	if err := rpc.Connect(ctx, p); err != nil {
+		fmt.Println("rpc.Connect failed", err)
 		return err
 	}
 	// create driver
@@ -79,6 +82,7 @@ func (d *UiDriver) Start(ctx context.Context) error {
 	}
 	res, err := rpc.SendMessage(ctx, payload, time.Second)
 	if err != nil {
+		fmt.Println("rpc.SendMessage failed", err)
 		// Recovery: remove device agent and resend, restart daemon, reconnect, retry once
 		rpc.Close()
 		_ = d.shell(ctx, "rm /data/local/tmp/agent.so")
@@ -104,6 +108,7 @@ func (d *UiDriver) Start(ctx context.Context) error {
 		d.driverName = s
 	} else {
 		rpc.Close()
+		fmt.Println("invalid create response")
 		return errors.New("invalid create response")
 	}
 	d.conn = rpc
