@@ -22,18 +22,13 @@ const (
 
 // UiDriver provides minimal uitest RPC capabilities similar to TS version.
 type UiDriver struct {
-	target        *Target
-	driverName    string
-	port          int
-	conn          *uiRPCConn
-	mu            sync.Mutex
-	sdkVersion    string
-	sdkPath       string
-	needEnsureSDK bool
-}
-
-func (d *UiDriver) SetNeedEnsureSDK(needEnsureSDK bool) {
-	d.needEnsureSDK = needEnsureSDK
+	target     *Target
+	driverName string
+	port       int
+	conn       *uiRPCConn
+	mu         sync.Mutex
+	sdkVersion string
+	sdkPath    string
 }
 
 func (t *Target) CreateUiDriver() *UiDriver { return &UiDriver{target: t} }
@@ -63,7 +58,11 @@ func (d *UiDriver) Start(ctx context.Context) error {
 		return err
 	}
 	rpc := &uiRPCConn{}
-	if err := rpc.Connect(ctx, p); err != nil {
+	serverHost := d.target.client.opts.Host
+	if serverHost == "" {
+		serverHost = "127.0.0.1"
+	}
+	if err := rpc.Connect(ctx, serverHost, p); err != nil {
 		return err
 	}
 	// create driver
@@ -91,7 +90,7 @@ func (d *UiDriver) Start(ctx context.Context) error {
 		_ = d.shell(ctx, "uitest start-daemon singleness")
 		time.Sleep(2 * time.Second)
 		rpc = &uiRPCConn{}
-		if err2 := rpc.Connect(ctx, p); err2 != nil {
+		if err2 := rpc.Connect(ctx, serverHost, p); err2 != nil {
 			return err2
 		}
 		res, err = rpc.SendMessage(ctx, payload, time.Second)
@@ -183,31 +182,40 @@ func (d *UiDriver) call(ctx context.Context, method, api string, args any) (any,
 
 func (d *UiDriver) forwardTcp(ctx context.Context, remotePort int) (int, error) {
 	remote := "tcp:" + strconv.Itoa(remotePort)
+	// reuse existing mapping if any
 	forwards, err := d.target.ListForwards(ctx)
 	if err == nil {
 		for _, f := range forwards {
-			if f.Remote == remote {
-				// parse local tcp:port
-				if strings.HasPrefix(f.Local, "tcp:") {
-					if p, err := strconv.Atoi(strings.TrimPrefix(f.Local, "tcp:")); err == nil {
-						return p, nil
-					}
+			if f.Remote == remote && strings.HasPrefix(f.Local, "tcp:") {
+				if p, err := strconv.Atoi(strings.TrimPrefix(f.Local, "tcp:")); err == nil {
+					return p, nil
 				}
 			}
 		}
 	}
-	// allocate free port
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
+	// TS behavior when hdc server is local: choose a free local port then forward
+	serverHost := d.target.client.opts.Host
+	if serverHost == "" || serverHost == "127.0.0.1" || strings.EqualFold(serverHost, "localhost") {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return 0, err
+		}
+		p := l.Addr().(*net.TCPAddr).Port
+		_ = l.Close()
+		local := "tcp:" + strconv.Itoa(p)
+		if err := d.target.Forward(ctx, local, remote); err != nil {
+			return 0, err
+		}
+		return p, nil
 	}
-	p := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close()
-	local := "tcp:" + strconv.Itoa(p)
-	if err := d.target.Forward(ctx, local, remote); err != nil {
-		return 0, err
+	// Remote hdc server: probe a port range on server
+	for p := 20000; p < 30000; p++ {
+		local := "tcp:" + strconv.Itoa(p)
+		if err := d.target.Forward(ctx, local, remote); err == nil {
+			return p, nil
+		}
 	}
-	return p, nil
+	return 0, errors.New("no available port for forward")
 }
 
 func (d *UiDriver) shell(ctx context.Context, cmd string) error {
@@ -221,9 +229,6 @@ func (d *UiDriver) shell(ctx context.Context, cmd string) error {
 
 // ensureSdk checks and pushes uitest agent if needed.
 func (d *UiDriver) ensureSdk(ctx context.Context) error {
-	if !d.needEnsureSDK {
-		return nil
-	}
 	if d.sdkVersion == "" {
 		d.sdkVersion = "1.1.0"
 	}
@@ -312,9 +317,9 @@ type uiRPCConn struct {
 	onMsg    func(session uint32, payload []byte)
 }
 
-func (u *uiRPCConn) Connect(ctx context.Context, port int) error {
+func (u *uiRPCConn) Connect(ctx context.Context, host string, port int) error {
 	d := net.Dialer{}
-	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		return err
 	}
