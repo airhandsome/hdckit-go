@@ -150,8 +150,29 @@ func (t *Target) RemoveReverse(ctx context.Context, remote, local string) error 
 	return t.RemoveForward(ctx, local, remote)
 }
 
+// hdcArgs builds base args with optional -s host:port and the device -t key.
+func (t *Target) hdcArgs() []string {
+	args := []string{}
+	h := t.client.opts.Host
+	p := t.client.opts.Port
+	if h != "" || p != 0 {
+		addr := h
+		if addr == "" {
+			addr = "127.0.0.1"
+		}
+		if p != 0 {
+			addr = addr + ":" + itoa(p)
+		}
+		args = append(args, "-s", addr)
+	}
+	args = append(args, "-t", t.key)
+	return args
+}
+
 func (t *Target) SendFile(ctx context.Context, local, remote string) error {
-	cmd := exec.CommandContext(ctx, t.client.opts.Bin, "-t", t.key, "file", "send", local, remote)
+	base := t.hdcArgs()
+	args := append(base, "file", "send", local, remote)
+	cmd := exec.CommandContext(ctx, t.client.opts.Bin, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return err
@@ -163,7 +184,9 @@ func (t *Target) SendFile(ctx context.Context, local, remote string) error {
 }
 
 func (t *Target) RecvFile(ctx context.Context, remote, local string) error {
-	cmd := exec.CommandContext(ctx, t.client.opts.Bin, "-t", t.key, "file", "recv", remote, local)
+	base := t.hdcArgs()
+	args := append(base, "file", "recv", remote, local)
+	cmd := exec.CommandContext(ctx, t.client.opts.Bin, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return err
@@ -175,7 +198,9 @@ func (t *Target) RecvFile(ctx context.Context, remote, local string) error {
 }
 
 func (t *Target) Install(ctx context.Context, hap string) error {
-	cmd := exec.CommandContext(ctx, t.client.opts.Bin, "-t", t.key, "install", hap)
+	base := t.hdcArgs()
+	args := append(base, "install", hap)
+	cmd := exec.CommandContext(ctx, t.client.opts.Bin, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return err
@@ -187,7 +212,9 @@ func (t *Target) Install(ctx context.Context, hap string) error {
 }
 
 func (t *Target) Uninstall(ctx context.Context, bundle string) error {
-	cmd := exec.CommandContext(ctx, t.client.opts.Bin, "-t", t.key, "uninstall", bundle)
+	base := t.hdcArgs()
+	args := append(base, "uninstall", bundle)
+	cmd := exec.CommandContext(ctx, t.client.opts.Bin, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return err
