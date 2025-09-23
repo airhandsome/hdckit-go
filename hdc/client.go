@@ -8,9 +8,10 @@ import (
 )
 
 type Options struct {
-	Host string
-	Port int
-	Bin  string
+	Host  string
+	Port  int
+	Bin   string
+	Debug bool
 }
 
 type Client struct {

@@ -14,9 +14,10 @@ import (
 )
 
 var (
-	host string
-	port int
-	bin  string
+	host  string
+	port  int
+	bin   string
+	debug bool
 )
 
 func main() {
@@ -56,6 +57,7 @@ hdccli ui input "hello"`}
 	root.PersistentFlags().StringVar(&host, "host", "127.0.0.1", "hdc host")
 	root.PersistentFlags().IntVar(&port, "port", 8710, "hdc port")
 	root.PersistentFlags().StringVar(&bin, "bin", "hdc", "hdc binary path")
+	root.PersistentFlags().BoolVar(&debug, "debug", true, "enable debug logs")
 
 	root.AddCommand(cmdList(), cmdTrack(), cmdShell(), cmdForward(), cmdReverse(), cmdFile(), cmdInstall(), cmdUninstall(), cmdHilog(), cmdUi())
 
@@ -65,7 +67,9 @@ hdccli ui input "hello"`}
 	}
 }
 
-func client() *hdc.Client { return hdc.NewClient(hdc.Options{Host: host, Port: port, Bin: bin}) }
+func client() *hdc.Client {
+	return hdc.NewClient(hdc.Options{Host: host, Port: port, Bin: bin, Debug: debug})
+}
 
 func singleTargetOrErr(ctx context.Context) (string, error) {
 	ts, err := client().ListTargets(ctx)

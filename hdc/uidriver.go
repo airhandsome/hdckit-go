@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -47,26 +48,43 @@ func (d *UiDriver) Start(ctx context.Context) error {
 	if d.conn != nil {
 		return nil
 	}
+	if d.target.client.opts.Debug {
+		fmt.Printf("[ui] start target=%s\n", d.target.key)
+	}
 	// enable test mode
-	_ = d.shell(ctx, "param set persist.ace.testmode.enabled 1")
+	if err := d.shell(ctx, "param set persist.ace.testmode.enabled 1"); err != nil {
+		if d.target.client.opts.Debug {
+			fmt.Printf("[ui] enable test mode failed: %v\n", err)
+		}
+	}
 	// ensure SDK agent
 	if err := d.ensureSdk(ctx); err != nil {
-		fmt.Println("ensureSdk failed", err)
+		if d.target.client.opts.Debug {
+			fmt.Println("[ui] ensureSdk failed", err)
+		}
 		return err
 	}
 	// ensure uitest daemon running
-	_ = d.shell(ctx, "uitest start-daemon singleness")
-	// give daemon time to come up similar to TS
-	time.Sleep(2 * time.Second)
+	if err := d.shell(ctx, "uitest start-daemon singleness"); err != nil {
+		if d.target.client.opts.Debug {
+			fmt.Printf("[ui] start-daemon failed: %v\n", err)
+		}
+	}
+	// give daemon time to come up similar to TS (slightly longer for slow devices)
+	time.Sleep(3 * time.Second)
 	// ensure forward tcp:8012
 	p, err := d.forwardTcp(ctx, 8012)
 	if err != nil {
-		fmt.Println("forwardTcp failed", err)
+		if d.target.client.opts.Debug {
+			fmt.Println("[ui] forwardTcp failed", err)
+		}
 		return err
 	}
 	rpc := &uiRPCConn{}
 	if err := rpc.Connect(ctx, p); err != nil {
-		fmt.Println("rpc.Connect failed", err)
+		if d.target.client.opts.Debug {
+			fmt.Println("[ui] rpc.Connect failed", err)
+		}
 		return err
 	}
 	// create driver
@@ -80,25 +98,63 @@ func (d *UiDriver) Start(ctx context.Context) error {
 			"message_type": "hypium",
 		},
 	}
-	res, err := rpc.SendMessage(ctx, payload, time.Second)
+	if d.target.client.opts.Debug {
+		fmt.Printf("[ui] create driver via rpc\n")
+	}
+	res, err := rpc.SendMessage(ctx, payload, 3*time.Second)
 	if err != nil {
-		fmt.Println("rpc.SendMessage failed", err)
+		if d.target.client.opts.Debug {
+			fmt.Println("[ui] rpc.SendMessage failed", err)
+		}
 		// Recovery: remove device agent and resend, restart daemon, reconnect, retry once
 		rpc.Close()
-		_ = d.shell(ctx, "rm /data/local/tmp/agent.so")
-		if d.sdkPath == "" {
-			d.sdkPath = defaultSdkPath()
+		// 仅当设备端 agent 缺失或版本过低时才重装
+		needReinstall := true
+		if raw, e := d.catAgent(ctx); e == nil {
+			cur := extractVersion(raw)
+			want := d.sdkVersion
+			if want == "" {
+				want = "1.1.0"
+			}
+			if strings.Contains(raw, "UITEST_AGENT_LIBRARY") && cmpVersion(cur, want) >= 0 {
+				needReinstall = false
+			}
+			if d.target.client.opts.Debug {
+				fmt.Printf("[ui] catAgent ok cur=%q want=%q reinstall=%v\n", cur, want, needReinstall)
+			}
+		} else {
+			if d.target.client.opts.Debug {
+				fmt.Printf("[ui] catAgent failed: %v\n", e)
+			}
 		}
-		if err2 := d.target.SendFile(ctx, d.sdkPath, "/data/local/tmp/agent.so"); err2 != nil {
-			return fmt.Errorf("reinstall agent failed: %w", err2)
+		if needReinstall {
+			_ = d.shell(ctx, "rm /data/local/tmp/agent.so")
+			if d.sdkPath == "" {
+				d.sdkPath = defaultSdkPath()
+			}
+			// 发送带重试
+			var sendErr error
+			for i := 0; i < 3; i++ {
+				sendErr = d.target.SendFile(ctx, d.sdkPath, "/data/local/tmp/agent.so")
+				if sendErr == nil {
+					break
+				}
+				if d.target.client.opts.Debug {
+					fmt.Printf("[ui] send agent retry %d failed: %v\n", i+1, sendErr)
+				}
+				time.Sleep(500 * time.Millisecond)
+			}
+			if sendErr != nil {
+				return fmt.Errorf("reinstall agent failed: %w", sendErr)
+			}
 		}
 		_ = d.shell(ctx, "uitest start-daemon singleness")
-		time.Sleep(2 * time.Second)
+		time.Sleep(3 * time.Second)
 		rpc = &uiRPCConn{}
 		if err2 := rpc.Connect(ctx, p); err2 != nil {
 			return err2
 		}
-		res, err = rpc.SendMessage(ctx, payload, time.Second)
+		res, err = rpc.SendMessage(ctx, payload, 3*time.Second)
 		if err != nil {
 			rpc.Close()
 			return err
@@ -210,6 +266,9 @@ func (d *UiDriver) forwardTcp(ctx context.Context, remotePort int) (int, error) 
 	_ = l.Close()
 	local := "tcp:" + strconv.Itoa(p)
 	if err := d.target.Forward(ctx, local, remote); err != nil {
+		if err == io.EOF {
+			return p, nil
+		}
 		return 0, err
 	}
 	return p, nil
